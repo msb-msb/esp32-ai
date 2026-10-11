@@ -68,6 +68,12 @@
 #if CORE_SIMD && !HEAD_SIMD
 #error "CORE_SIMD uses the HEAD_SIMD worker plumbing and kernels"
 #endif
+// 1 puts the logits buffer (out_vocab floats, 99 KiB) in internal SRAM, so the
+// head's writes and the argmax read stay off PSRAM; 0 keeps it in PSRAM.
+// Values are unchanged.
+#ifndef LOGITS_SRAM
+#define LOGITS_SRAM 1
+#endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
@@ -495,9 +501,23 @@ static void alloc_scratch() {
   s.tmpP  = (float *)sram_or_die(L * P * 4, "tmpP");
   s.trow  = (float *)sram_or_die(L * P * 4, "trow");
   s.scores = (float *)sram_or_die(S * 4, "scores");
-  // logits: out_vocab floats, 99 KiB here, read once per token. Left in PSRAM
-  // rather than spend a fifth of internal SRAM on it.
-  s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
+  // logits: out_vocab floats, 99 KiB here, written by the head and read once by
+  // the argmax per token. Upstream left them in PSRAM rather than spend a fifth
+  // of internal SRAM; LOGITS_SRAM=1 spends it (about 309 -> 207 KB free on an
+  // N16R8) and takes the head's 99 KiB of writes off PSRAM.
+  {
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    size_t f0 = heap_caps_get_free_size(caps), b0 = heap_caps_get_largest_free_block(caps);
+#if LOGITS_SRAM
+    s.logits = (float *)sram_or_die((size_t)model.out_vocab * 4, "logits");
+#else
+    s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
+#endif
+    Serial.printf("logits -> %s %u B; internal free %u -> %u B, largest block %u -> %u B\n",
+                  LOGITS_SRAM ? "SRAM  " : "PSRAM ", (unsigned)model.out_vocab * 4,
+                  (unsigned)f0, (unsigned)heap_caps_get_free_size(caps),
+                  (unsigned)b0, (unsigned)heap_caps_get_largest_free_block(caps));
+  }
   // KV cache: 1.1MB, read once per position rather than per matvec.
   s.kcache = (float *)ps_or_die((size_t)L * S * D * 4, "kcache");
   s.vcache = (float *)ps_or_die((size_t)L * S * D * 4, "vcache");
