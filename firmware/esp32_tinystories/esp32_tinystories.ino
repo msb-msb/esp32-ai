@@ -50,6 +50,12 @@
 #error "STOP_AT_EOT needs VOCAB_EOT_ID: regenerate generated/vocab.h"
 #endif
 
+// Output head on the S3 PIE int8 MAC (head_dot96_s8.S). 0 keeps the original
+// scalar head; the layers use the scalar path either way.
+#ifndef HEAD_SIMD
+#define HEAD_SIMD 1
+#endif
+
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
@@ -102,6 +108,18 @@ static float job_xs;
 static float *job_y;
 static int job_split;
 
+#if HEAD_SIMD
+typedef void (*range_fn)(const QT *, const int8_t *, float, float *, int, int);
+static range_fn job_fn;
+
+static void worker_main(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    job_fn(job_t, job_xq, job_xs, job_y, 0, job_split);
+    xTaskNotifyGive(main_h);
+  }
+}
+#else
 static void worker_main(void *) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -109,17 +127,86 @@ static void worker_main(void *) {
     xTaskNotifyGive(main_h);
   }
 }
+#endif
 
 static void matvec_par(const QT *t, const float *x, float *y) {
   static int8_t xq[LLM_Q8_MAX_INPUT];
   float xs;
   if (t->w8 == NULL || t->rows < 128) { MATVEC(t, x, y); return; }
   quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
+#if HEAD_SIMD
+  job_fn = matvec_i8_range;
+#endif
   job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
   xTaskNotifyGive(worker_h);
   matvec_i8_range(t, xq, xs, y, job_split, t->rows);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
+
+#if HEAD_SIMD
+// ---- SIMD output head ---------------------------------------------------------
+// Same arithmetic as matvec_i8_range for a one-group, 96-column tensor: the
+// int32 row dots come from the PIE kernel (exact), and the float tail below is
+// the same expression, so logits are bit-identical to the scalar head.
+extern "C" void llm_head_dot96_s8(const int8_t *w, const int8_t *x, int32_t *out,
+                                  uint32_t rows);
+#define HEAD_COLS 96
+#define HEAD_BLOCK 64
+
+static void head_i8_range_simd(const QT *t, const int8_t *xq, float x_scale,
+                               float *y, int row_begin, int row_end) {
+  int32_t d[HEAD_BLOCK];
+  for (int r0 = row_begin; r0 < row_end; r0 += HEAD_BLOCK) {
+    int n = row_end - r0 < HEAD_BLOCK ? row_end - r0 : HEAD_BLOCK;
+    llm_head_dot96_s8(t->w8 + (size_t)r0 * HEAD_COLS, xq, d, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      float acc = 0.f;
+      acc += (float)d[i] * t->scale8[r0 + i];
+      y[r0 + i] = acc * x_scale;
+    }
+  }
+}
+
+static void matvec_par_head(const QT *t, const float *x, float *y) {
+  static int8_t xq[LLM_Q8_MAX_INPUT] __attribute__((aligned(16)));
+  float xs;
+  quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
+  job_fn = head_i8_range_simd;
+  job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
+  xTaskNotifyGive(worker_h);
+  head_i8_range_simd(t, xq, xs, y, job_split, t->rows);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
+// Preconditions of the kernel, then every row against the scalar llm_dot_i8 on
+// a fixed activation that includes both int8 extremes.
+static bool head_simd_check(const QT *t) {
+  if (t->w8 == NULL || t->cols != HEAD_COLS || t->n_groups != 1 ||
+      ((uintptr_t)t->w8 & 15) != 0) {
+    Serial.printf("FATAL: SIMD head needs staged, 16B-aligned, %d-col, 1-group "
+                  "weights (cols=%d groups=%d w8=%p)\n",
+                  HEAD_COLS, t->cols, t->n_groups, t->w8);
+    return false;
+  }
+  static int8_t xt[HEAD_COLS] __attribute__((aligned(16)));
+  for (int j = 0; j < HEAD_COLS; j++)
+    xt[j] = (j % 3 == 0) ? 127 : (j % 3 == 1) ? -127 : (int8_t)(j * 37 - 90);
+  int32_t d[HEAD_BLOCK];
+  int bad = 0;
+  for (int r0 = 0; r0 < t->rows; r0 += HEAD_BLOCK) {
+    int n = t->rows - r0 < HEAD_BLOCK ? t->rows - r0 : HEAD_BLOCK;
+    llm_head_dot96_s8(t->w8 + (size_t)r0 * HEAD_COLS, xt, d, (uint32_t)n);
+    for (int i = 0; i < n; i++)
+      if (d[i] != llm_dot_i8(t->w8 + (size_t)(r0 + i) * HEAD_COLS, xt, HEAD_COLS)) {
+        if (bad < 4) Serial.printf("simd head mismatch row %d\n", r0 + i);
+        bad++;
+      }
+  }
+  Serial.printf("simd head selftest: %d/%d rows %s\n", t->rows - bad, t->rows,
+                bad ? "FAIL" : "ok");
+  return bad == 0;
+}
+#endif
 
 // Copy RMSNorm weights from mapped flash to internal SRAM.
 static void copy_norms_to_sram() {
@@ -234,7 +321,19 @@ void setup() {
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs.
   {
+#if HEAD_SIMD
+    // 16-byte aligned for ee.vld.128.
+    size_t hb = llm_stage_int8_bytes(&model.out_head);
+    void *b = heap_caps_aligned_alloc(16, hb, MALLOC_CAP_SPIRAM);
+    if (!b) {
+      Serial.printf("FATAL: required PSRAM allocation failed: staged head (%u bytes)\n",
+                    (unsigned)hb);
+      while (1) delay(1000);
+    }
+    psram_used += hb;
+#else
     void *b = ps_or_die(llm_stage_int8_bytes(&model.out_head), "staged head");
+#endif
     llm_stage_int8(&model.out_head, b);
     ++staged;
   }
@@ -245,7 +344,13 @@ void setup() {
   if (xTaskCreatePinnedToCore(worker_main, "mv", 4096, NULL, 2, &worker_h, 0) == pdPASS) {
     // After the worker exists: matvec_par notifies worker_h.
     model.layer_matvec = matvec_par;
+#if HEAD_SIMD
+    if (!head_simd_check(&model.out_head)) while (1) delay(1000);
+    model.head_matvec  = matvec_par_head;
+    Serial.println("head   -> PIE int8 (head_dot96_s8)");
+#else
     model.head_matvec  = matvec_par;
+#endif
   } else {
     Serial.println("dual-core worker failed; running single core");
   }
