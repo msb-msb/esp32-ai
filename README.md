@@ -1,3 +1,139 @@
+## InsiderLLM fork
+
+This is a fork of [slvDev/esp32-ai](https://github.com/slvDev/esp32-ai), and upstream is the canonical project. The
+model, the firmware and the method are slvDev's; everything below the line is upstream's README, unchanged.
+
+This fork adds speed patches for the TinyStories sketch on an ESP32-S3 N16R8:
+- The output changes in no build. The logits are bit-identical (FNV-1a over the first 20 tokens' raw logits:
+  `4400a1cbf4a5137d`), and the 200-token text is byte-identical (sha256 `b9abf55b…c467`).
+- There are also an interactive serial mode and an optional stop at end of story.
+- These changes are offered upstream in [slvDev/esp32-ai#26](https://github.com/slvDev/esp32-ai/issues/26). Nothing
+  here is endorsed by upstream.
+
+### Branches
+
+Each branch is one change, stacked on the one before it. Every change sits behind a compile-time flag. The defaults
+reproduce upstream behaviour except where the change itself is the point.
+
+| branch | flag (default) | change |
+|---|---|---|
+| `no-display-flag` | `USE_DISPLAY` (1) | Display as a build flag. `scripts/deploy.sh` passes `DEFINES` to the compiler. |
+| `eot-stop` | `STOP_AT_EOT` (0) | `generate_vocab.py` writes `VOCAB_EOT_ID`. With 1, generation stops at `<|endoftext|>`. |
+| `simd-head` | `HEAD_SIMD` (1) | Output head on the S3 PIE int8 MAC (`head_dot96_s8.S`). |
+| `int4-head` | `HEAD_INT4` (1) | Head streamed as packed int4, unpacked exactly in PIE. |
+| `simd-core` | `CORE_SIMD` (1) | All core int8 matvecs on PIE (dot96 / dot128 / zero-padded dot80). |
+| `logits-sram` | `LOGITS_SRAM` (1) | Logits buffer in internal SRAM instead of PSRAM. |
+| `int4-core` | `CORE_INT4` (1) | Core weights streamed as packed int4 (dot96_s4 / dot128_s4, down padded to 96). |
+| `interactive` | `INTERACTIVE` (0) | Line protocol on native USB serial, for a host chat client. |
+| `prefill-skip` | `PREFILL_SKIP` (1) | The head is skipped on prompt positions before the last. |
+| **`insiderllm`** | | All of the above, plus this section. The default branch. |
+| `tools` | `LOGIT_CHECKSUM` (0) | `insiderllm` plus the logit-hash gate and the host scripts in `scripts/insiderllm/`. |
+
+All the PIE kernels are checked at boot against the scalar arithmetic, on every row of every tensor. A failed
+self-test stops the boot.
+
+### Build progression
+
+ESP32-S3 N16R8 (rev v0.2, 16 MB QIO flash and 8 MB octal PSRAM, both at 80 MHz), CPU at 240 MHz, Arduino-ESP32 core
+3.3.10, `-O3`, release `model.bin`, no display attached. Each row is 3 resets × 200 greedy tokens from the compiled
+prompt "Once upon a time". All three runs printed identical values.
+
+| build | head ms | non-head ms | ms/token | tok/s (end to end) | logit hash |
+|---|---:|---:|---:|---:|---|
+| upstream with `USE_DISPLAY=0` (scalar head) | 59.1 | 35.5 | 94.7 | 10.34 | `4400a1cbf4a5137d` |
+| + `simd-head` | 43.6 | 35.5 | 79.1 | 12.31 | `4400a1cbf4a5137d` |
+| + `int4-head` | 24.1 | 35.5 | 59.6 | 16.21 | `4400a1cbf4a5137d` |
+| + `simd-core` | 24.1 | 26.4 | 50.4 | 19.05 | `4400a1cbf4a5137d` |
+| + `logits-sram` | 21.2 | 26.3 | 47.5 | 20.62 | `4400a1cbf4a5137d` |
+| **+ `int4-core`** (= `insiderllm`) | **21.2** | **22.0** | **43.3** | **22.59** | **`4400a1cbf4a5137d`** |
+
+- **Upstream's figure:** upstream publishes 94.9 ms/token and 9.88 tok/s with a display attached.
+- **The other three branches** don't change these numbers: `eot-stop` and `interactive` are off by default, and
+  `prefill-skip` only touches prompt positions, which are outside the timed loop.
+- **Other clocks:** at 160 and 80 MHz, `insiderllm` measures 49.5 and 69.5 ms/token.
+- **What remains:** the head and the core now sit at roughly 62 MB/s of PSRAM traffic, so what's left is memory
+  traffic, not compute.
+
+### Build and flash (Linux)
+
+You need the following:
+- `arduino-cli` with the ESP32 core 3.3.10;
+- [`uv`](https://docs.astral.sh/uv/), which `deploy.sh` uses for its header tools;
+- `python3`, `cc`;
+- the board on its native USB port (`/dev/ttyACM0`).
+
+```bash
+arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli core update-index
+arduino-cli core install esp32:esp32@3.3.10
+
+git clone -b insiderllm https://github.com/msb-msb/esp32-ai.git
+cd esp32-ai
+scripts/fetch_model.sh tinystories
+PORT=/dev/ttyACM0 DEFINES="-DUSE_DISPLAY=0" scripts/deploy.sh tinystories
+arduino-cli monitor -p /dev/ttyACM0 --config baudrate=115200
+```
+
+- **What `deploy.sh` does:** it regenerates `generated/vocab.h` (now with `VOCAB_EOT_ID`), runs upstream's host
+  gates, compiles, and flashes both the model and the firmware.
+- **The FQBN** is upstream's, unchanged:
+  `esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info`.
+- **Defines:** drop `-DUSE_DISPLAY=0` if the SH1106 OLED is wired up. Without a panel, the display code's I2C errors
+  cut end-to-end speed from 10.34 to 5.43 tok/s.
+- **Defaults:** every other flag in the table defaults to the measured configuration. Override any of them in
+  `DEFINES`, for example `DEFINES="-DUSE_DISPLAY=0 -DCORE_INT4=0"`.
+
+After the self-test lines (`simd core int4 selftest: … ok`, `simd head selftest: 25353/25353 rows ok`), the end of
+the boot log should read:
+
+```
+--- 200 tokens in 8.85 s ---
+throughput: 22.59 tok/s   (43.3 ms/token)
+profile ms/token: input 1.0 | attn 16.1 | ffn 2.4 | ple 2.5 | head 21.2
+```
+
+**Checking the logits yourself.** On the `tools` branch, use
+`DEFINES="-DUSE_DISPLAY=0 -DLOGIT_CHECKSUM=1"`. The run then prints per-token hashes and
+`logit_hash_all 4400a1cbf4a5137d (n=20)`.
+
+### Chat with the board
+
+Build the interactive firmware, then run the host client from the `tools` branch:
+
+```bash
+git checkout tools
+PORT=/dev/ttyACM0 DEFINES="-DUSE_DISPLAY=0 -DINTERACTIVE=1" scripts/deploy.sh tinystories
+uv run --no-project --with pyserial --with 'tokenizers==0.23.1' \
+  python scripts/insiderllm/chat.py --port /dev/ttyACM0 --temp 0.8 --top-p 0.9
+```
+
+Type a prompt per line, and each reply streams back as it is generated.
+- **Prompts are one-shot:** the board clears its KV cache for every prompt.
+- **Greedy and its limits:** `--temp 0` is the benchmark's greedy argmax. `--eot 1` (the default) stops at end of
+  story.
+- **Speed:** greedy decode runs at 43.33 ms/token. Sampling adds about 32 ms per token outside the forward pass, so
+  sampled chat comes out near 13 tok/s.
+- **It is still TinyStories:** it writes children's stories, and it likes Lily.
+
+### Measurements
+
+The public records hold logs, patch hashes, build info and the pre-registered predictions. They are in
+[msb-msb/insiderllm-bench-results](https://github.com/msb-msb/insiderllm-bench-results):
+- [reproduction of upstream](https://github.com/msb-msb/insiderllm-bench-results/tree/main/miu-esp32-s3-repro-2026-10-10/)
+- [CPU-clock sweep](https://github.com/msb-msb/insiderllm-bench-results/tree/main/miu-cpu-clock-01-2026-10-10/)
+- [SIMD head](https://github.com/msb-msb/insiderllm-bench-results/tree/main/miu-simd-head-01-2026-10-10/)
+- [int4 head](https://github.com/msb-msb/insiderllm-bench-results/tree/main/miu-int4-head-01-2026-10-10/)
+- [SIMD core](https://github.com/msb-msb/insiderllm-bench-results/tree/main/miu-simd-core-01-2026-10-10/)
+- [training reproduction](https://github.com/msb-msb/insiderllm-bench-results/tree/main/tamanna-ts-repro-2026-10-10/)
+- [story-boundary decoding test](https://github.com/msb-msb/insiderllm-bench-results/tree/main/tamanna-decode-01-2026-10-10/)
+
+The records for `eot-stop`, `logits-sram`, `int4-core`, `interactive` and `prefill-skip` (measured 2026-10-11) will
+be published to the same repository.
+
+Changes (c) 2026 Mark Bartlett / InsiderLLM, under the same MIT License as upstream (`LICENSE`, unchanged).
+
+---
+
 # Running a 28.9M parameter LLM on a microcontroller
 
 <p align="center">
