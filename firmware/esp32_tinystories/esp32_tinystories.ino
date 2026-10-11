@@ -55,6 +55,11 @@
 #ifndef HEAD_SIMD
 #define HEAD_SIMD 1
 #endif
+// With HEAD_SIMD: 1 streams the head as packed int4 (llm_head_dot96_s4, about
+// half the PSRAM bytes); 0 keeps the staged int8 head (llm_head_dot96_s8).
+#ifndef HEAD_INT4
+#define HEAD_INT4 1
+#endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
@@ -167,19 +172,112 @@ static void head_i8_range_simd(const QT *t, const int8_t *xq, float x_scale,
   }
 }
 
+#if HEAD_INT4
+// ---- packed int4 head -------------------------------------------------------
+// Restaged at boot from the model's offset-8 codes into the kernel's layout:
+// per row three 16-byte chunks; chunk c byte k = element 32c+k (low nibble) and
+// element 32c+16+k (high nibble), two's-complement int4. Values are unchanged,
+// so the int32 dots, and with the same fp32 scales the logits, are identical.
+extern "C" void llm_head_dot96_s4(const uint8_t *w, const int8_t *x, int32_t *out,
+                                  uint32_t rows);
+#define HEAD4_ROW_BYTES (HEAD_COLS / 2)
+static const uint8_t *head4_w;     // rows * 48 B, 16-byte aligned, PSRAM
+static const float *head4_sc;      // rows fp32 scales, PSRAM
+
+static inline int head_code(const QT *t, int r, int j) {   // file code, 0..15
+  uint8_t b = t->codes[(size_t)r * t->row_bytes + (j >> 1)];
+  return (j & 1) ? (b >> 4) : (b & 0xF);
+}
+
+static size_t head4_bytes(const QT *t) {
+  return (size_t)t->rows * HEAD4_ROW_BYTES + (size_t)t->rows * sizeof(float);
+}
+
+static void head4_stage(const QT *t, void *buffer) {
+  uint8_t *w = (uint8_t *)buffer;
+  float *sc = (float *)(w + (size_t)t->rows * HEAD4_ROW_BYTES);
+  for (int r = 0; r < t->rows; r++) {
+    uint8_t *dst = w + (size_t)r * HEAD4_ROW_BYTES;
+    for (int c = 0; c < 3; c++)
+      for (int k = 0; k < 16; k++) {
+        int lo = head_code(t, r, 32 * c + k) - 8;
+        int hi = head_code(t, r, 32 * c + 16 + k) - 8;
+        dst[16 * c + k] = (uint8_t)((lo & 0xF) | ((hi & 0xF) << 4));
+      }
+    sc[r] = half2float(t->scales[r]);
+  }
+  head4_w = w;
+  head4_sc = sc;
+}
+
+static void head_i4_range_simd(const QT *t, const int8_t *xq, float x_scale,
+                               float *y, int row_begin, int row_end) {
+  int32_t d[HEAD_BLOCK];
+  for (int r0 = row_begin; r0 < row_end; r0 += HEAD_BLOCK) {
+    int n = row_end - r0 < HEAD_BLOCK ? row_end - r0 : HEAD_BLOCK;
+    llm_head_dot96_s4(head4_w + (size_t)r0 * HEAD4_ROW_BYTES, xq, d, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      float acc = 0.f;
+      acc += (float)d[i] * head4_sc[r0 + i];
+      y[r0 + i] = acc * x_scale;
+    }
+  }
+}
+#endif
+
 static void matvec_par_head(const QT *t, const float *x, float *y) {
   static int8_t xq[LLM_Q8_MAX_INPUT] __attribute__((aligned(16)));
   float xs;
   quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
-  job_fn = head_i8_range_simd;
+#if HEAD_INT4
+  range_fn head_fn = head_i4_range_simd;
+#else
+  range_fn head_fn = head_i8_range_simd;
+#endif
+  job_fn = head_fn;
   job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
   xTaskNotifyGive(worker_h);
-  head_i8_range_simd(t, xq, xs, y, job_split, t->rows);
+  head_fn(t, xq, xs, y, job_split, t->rows);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
 
 // Preconditions of the kernel, then every row against the scalar llm_dot_i8 on
 // a fixed activation that includes both int8 extremes.
+#if HEAD_INT4
+// Every row of the int4 kernel against the scalar int4 arithmetic of
+// matvec_q8_range ((code - 8) * x, read straight from the model's codes), on a
+// fixed activation that includes both int8 extremes.
+static bool head_simd_check(const QT *t) {
+  if (head4_w == NULL || t->cols != HEAD_COLS || t->n_groups != 1 ||
+      ((uintptr_t)head4_w & 15) != 0) {
+    Serial.printf("FATAL: int4 head needs staged, 16B-aligned, %d-col, 1-group "
+                  "weights (cols=%d groups=%d w=%p)\n",
+                  HEAD_COLS, t->cols, t->n_groups, head4_w);
+    return false;
+  }
+  static int8_t xt[HEAD_COLS] __attribute__((aligned(16)));
+  for (int j = 0; j < HEAD_COLS; j++)
+    xt[j] = (j % 3 == 0) ? 127 : (j % 3 == 1) ? -127 : (int8_t)(j * 37 - 90);
+  int32_t d[HEAD_BLOCK];
+  int bad = 0;
+  for (int r0 = 0; r0 < t->rows; r0 += HEAD_BLOCK) {
+    int n = t->rows - r0 < HEAD_BLOCK ? t->rows - r0 : HEAD_BLOCK;
+    llm_head_dot96_s4(head4_w + (size_t)r0 * HEAD4_ROW_BYTES, xt, d, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      int32_t ref = 0;
+      for (int j = 0; j < HEAD_COLS; j++) ref += (head_code(t, r0 + i, j) - 8) * (int)xt[j];
+      if (d[i] != ref) {
+        if (bad < 4) Serial.printf("simd head mismatch row %d: %ld vs %ld\n",
+                                   r0 + i, (long)d[i], (long)ref);
+        bad++;
+      }
+    }
+  }
+  Serial.printf("simd head selftest: %d/%d rows %s\n", t->rows - bad, t->rows,
+                bad ? "FAIL" : "ok");
+  return bad == 0;
+}
+#else
 static bool head_simd_check(const QT *t) {
   if (t->w8 == NULL || t->cols != HEAD_COLS || t->n_groups != 1 ||
       ((uintptr_t)t->w8 & 15) != 0) {
@@ -206,6 +304,7 @@ static bool head_simd_check(const QT *t) {
                 bad ? "FAIL" : "ok");
   return bad == 0;
 }
+#endif  // HEAD_INT4
 #endif
 
 // Copy RMSNorm weights from mapped flash to internal SRAM.
@@ -321,7 +420,20 @@ void setup() {
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs.
   {
-#if HEAD_SIMD
+#if HEAD_SIMD && HEAD_INT4
+    // Packed int4 + fp32 scales, 16-byte aligned for ee.vld.128. out_head keeps
+    // w8 == NULL, so any non-hook caller still takes the exact int4 path.
+    size_t hb = head4_bytes(&model.out_head);
+    void *b = heap_caps_aligned_alloc(16, hb, MALLOC_CAP_SPIRAM);
+    if (!b) {
+      Serial.printf("FATAL: required PSRAM allocation failed: int4 head (%u bytes)\n",
+                    (unsigned)hb);
+      while (1) delay(1000);
+    }
+    psram_used += hb;
+    head4_stage(&model.out_head, b);
+    Serial.printf("head   -> PSRAM  packed int4, %u B\n", (unsigned)hb);
+#elif HEAD_SIMD
     // 16-byte aligned for ee.vld.128.
     size_t hb = llm_stage_int8_bytes(&model.out_head);
     void *b = heap_caps_aligned_alloc(16, hb, MALLOC_CAP_SPIRAM);
@@ -334,7 +446,9 @@ void setup() {
 #else
     void *b = ps_or_die(llm_stage_int8_bytes(&model.out_head), "staged head");
 #endif
+#if !(HEAD_SIMD && HEAD_INT4)
     llm_stage_int8(&model.out_head, b);
+#endif
     ++staged;
   }
   Serial.printf("weights-> PSRAM  %d tensors int8, %.2f MB allocated\n",
@@ -347,7 +461,11 @@ void setup() {
 #if HEAD_SIMD
     if (!head_simd_check(&model.out_head)) while (1) delay(1000);
     model.head_matvec  = matvec_par_head;
+#if HEAD_INT4
+    Serial.println("head   -> PIE int4 (head_dot96_s4)");
+#else
     Serial.println("head   -> PIE int8 (head_dot96_s8)");
+#endif
 #else
     model.head_matvec  = matvec_par;
 #endif
