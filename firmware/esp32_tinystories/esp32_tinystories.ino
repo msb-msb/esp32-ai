@@ -74,6 +74,15 @@
 #ifndef LOGITS_SRAM
 #define LOGITS_SRAM 1
 #endif
+// With CORE_SIMD: 1 streams the core matvec weights as packed int4 in the head's
+// kernel layout (llm_head_dot96_s4 for 96 columns and for down zero-padded to
+// 96, llm_dot128_s4 for 128); 0 keeps the staged int8 kernels.
+#ifndef CORE_INT4
+#define CORE_INT4 1
+#endif
+#if CORE_INT4 && !(CORE_SIMD && HEAD_INT4)
+#error "CORE_INT4 extends the CORE_SIMD path and reuses the int4 head kernel"
+#endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
@@ -374,16 +383,157 @@ static void core_i8_range_simd(const QT *t, const int8_t *xq, float x_scale,
   }
 }
 
+#if CORE_INT4
+// ---- packed int4 core ----------------------------------------------------------
+// Each core tensor restaged at boot from the model's offset-8 codes into the
+// int4 head layout: per row, ceil(cols/32) 16-byte chunks; chunk c byte k =
+// column 32c+k (low nibble) and column 32c+16+k (high nibble), two's
+// complement; columns past t->cols (down: 66..95) get zero weights. Values are
+// unchanged, so the int32 dots, and with the same fp32 scale8, the outputs are
+// identical. The int8 staging stays allocated for its scale8 (and is unread
+// otherwise).
+extern "C" void llm_dot128_s4(const uint8_t *w, const int8_t *x, int32_t *out,
+                              uint32_t rows);
+static const QT *core4_t[1 + 7 * LLM_MAX_LAYERS];
+static const uint8_t *core4_w[1 + 7 * LLM_MAX_LAYERS];
+static int core4_n;
+static const uint8_t *core4_cur;   // weights of the matvec in flight (both cores)
+
+static int core4_cols(const QT *t) { return t->cols > 96 ? 128 : 96; }
+
+static const uint8_t *core4_find(const QT *t) {
+  for (int i = 0; i < core4_n; i++) if (core4_t[i] == t) return core4_w[i];
+  return NULL;
+}
+
+static void *ps_aligned16(size_t n);
+static void core4_stage_one(const QT *t) {
+  int pc = core4_cols(t), rb = pc / 2;
+  size_t n = (size_t)t->rows * rb;
+  uint8_t *w = (uint8_t *)ps_aligned16(n);
+  if (!w) {
+    Serial.printf("FATAL: required PSRAM allocation failed: int4 core (%u bytes)\n",
+                  (unsigned)n);
+    while (1) delay(1000);
+  }
+  for (int r = 0; r < t->rows; r++) {
+    uint8_t *dst = w + (size_t)r * rb;
+    for (int c = 0; c < pc / 32; c++)
+      for (int k = 0; k < 16; k++) {
+        int jl = 32 * c + k, jh = 32 * c + 16 + k;
+        int lo = jl < t->cols ? head_code(t, r, jl) - 8 : 0;
+        int hi = jh < t->cols ? head_code(t, r, jh) - 8 : 0;
+        dst[16 * c + k] = (uint8_t)((lo & 0xF) | ((hi & 0xF) << 4));
+      }
+  }
+  core4_t[core4_n] = t;
+  core4_w[core4_n++] = w;
+}
+
+static size_t core4_stage() {
+  size_t bytes = 0;
+  core4_n = 0;
+  const QT *ts[1 + 7 * LLM_MAX_LAYERS];
+  int nt = 0;
+  ts[nt++] = &model.ple_model_proj;
+  for (int l = 0; l < model.c.n_layers; l++) {
+    ts[nt++] = &model.qkv[l];  ts[nt++] = &model.attn_proj[l];
+    ts[nt++] = &model.gate[l]; ts[nt++] = &model.up[l];  ts[nt++] = &model.down[l];
+    ts[nt++] = &model.ple_gate[l]; ts[nt++] = &model.ple_proj[l];
+  }
+  for (int i = 0; i < nt; i++) {
+    core4_stage_one(ts[i]);
+    bytes += (size_t)ts[i]->rows * (core4_cols(ts[i]) / 2);
+  }
+  return bytes;
+}
+
+// Exact int32 dots of rows [r0, r0+n) from packed int4 weights w4.
+static void core4_dots(const QT *t, const uint8_t *w4, const int8_t *xq, int32_t *d,
+                       int r0, int n) {
+  if (core4_cols(t) == 128)
+    llm_dot128_s4(w4 + (size_t)r0 * 64, xq, d, (uint32_t)n);
+  else
+    llm_head_dot96_s4(w4 + (size_t)r0 * 48, xq, d, (uint32_t)n);
+}
+
+static void core_i4_range_simd(const QT *t, const int8_t *xq, float x_scale,
+                               float *y, int row_begin, int row_end) {
+  const uint8_t *w4 = core4_cur;
+  int32_t d[HEAD_BLOCK];
+  for (int r0 = row_begin; r0 < row_end; r0 += HEAD_BLOCK) {
+    int n = row_end - r0 < HEAD_BLOCK ? row_end - r0 : HEAD_BLOCK;
+    core4_dots(t, w4, xq, d, r0, n);
+    for (int i = 0; i < n; i++) {
+      float acc = 0.f;
+      acc += (float)d[i] * t->scale8[r0 + i];
+      y[r0 + i] = acc * x_scale;
+    }
+  }
+}
+
+// Every row of every core tensor through its int4 kernel against the scalar
+// int4 arithmetic of matvec_q8_range ((code - 8) * x straight from the model's
+// codes), on a fixed activation with both int8 extremes and non-zero bytes past
+// column 66 (down's padding must contribute nothing).
+static bool core4_check() {
+  static int8_t xt[128] __attribute__((aligned(16)));
+  for (int j = 0; j < 128; j++)
+    xt[j] = (j % 3 == 0) ? 127 : (j % 3 == 1) ? -127 : (int8_t)(j * 37 - 90);
+  static const char *const name[3] = {"dot96_s4", "dot128_s4", "down96_s4"};
+  int rows[3] = {0, 0, 0}, bad[3] = {0, 0, 0};
+  for (int i = 0; i < core4_n; i++) {
+    const QT *t = core4_t[i];
+    const uint8_t *w4 = core4_w[i];
+    int k = t->cols == 128 ? 1 : (t->cols == 96 ? 0 : 2);
+    if ((t->cols != 96 && t->cols != 128 && t->cols != 66) || ((uintptr_t)w4 & 15) != 0 ||
+        t->scale8 == NULL || t->n_groups != 1) {
+      Serial.printf("FATAL: int4 core tensor %d unsupported (%dx%d, groups=%d, w4=%p)\n",
+                    i, t->rows, t->cols, t->n_groups, w4);
+      return false;
+    }
+    int32_t d[HEAD_BLOCK];
+    for (int r0 = 0; r0 < t->rows; r0 += HEAD_BLOCK) {
+      int n = t->rows - r0 < HEAD_BLOCK ? t->rows - r0 : HEAD_BLOCK;
+      core4_dots(t, w4, xt, d, r0, n);
+      for (int r = 0; r < n; r++) {
+        int32_t ref = 0;
+        for (int j = 0; j < t->cols; j++) ref += (head_code(t, r0 + r, j) - 8) * (int)xt[j];
+        if (d[r] != ref) {
+          if (bad[k] < 4) Serial.printf("int4 core mismatch: %s tensor %d row %d: %ld vs %ld\n",
+                                        name[k], i, r0 + r, (long)d[r], (long)ref);
+          bad[k]++;
+        }
+      }
+      rows[k] += n;
+    }
+  }
+  bool ok = true;
+  for (int k = 0; k < 3; k++) {
+    Serial.printf("simd core int4 selftest: %s %d/%d rows %s\n", name[k],
+                  rows[k] - bad[k], rows[k], bad[k] ? "FAIL" : "ok");
+    if (bad[k]) ok = false;
+  }
+  return ok;
+}
+#endif  // CORE_INT4
+
 static void matvec_core_simd(const QT *t, const float *x, float *y) {
   static int8_t xq[LLM_Q8_MAX_INPUT] __attribute__((aligned(16)));
   float xs;
   if (core_kernel(t) == K_NONE) { matvec_par(t, x, y); return; }   // not expected
+#if CORE_INT4
+  range_fn fn = core_i4_range_simd;
+  core4_cur = core4_find(t);
+#else
+  range_fn fn = core_i8_range_simd;
+#endif
   quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
-  if (t->rows < 128) { core_i8_range_simd(t, xq, xs, y, 0, t->rows); return; }
-  job_fn = core_i8_range_simd;
+  if (t->rows < 128) { fn(t, xq, xs, y, 0, t->rows); return; }
+  job_fn = fn;
   job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
   xTaskNotifyGive(worker_h);
-  core_i8_range_simd(t, xq, xs, y, job_split, t->rows);
+  fn(t, xq, xs, y, job_split, t->rows);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
 
@@ -597,6 +747,12 @@ void setup() {
 #if CORE_SIMD
   stage_down_pad();
 #endif
+#if CORE_INT4
+  {
+    size_t b4 = core4_stage();
+    Serial.printf("core   -> PSRAM  packed int4, %d tensors, %u B\n", core4_n, (unsigned)b4);
+  }
+#endif
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs.
   {
@@ -638,12 +794,21 @@ void setup() {
   if (xTaskCreatePinnedToCore(worker_main, "mv", 4096, NULL, 2, &worker_h, 0) == pdPASS) {
     // After the worker exists: matvec_par notifies worker_h.
 #if CORE_SIMD
+#if CORE_INT4
+    if (!core4_check()) {
+      Serial.println("FATAL: int4 core selftest failed");
+      while (1) delay(1000);
+    }
+    model.layer_matvec = matvec_core_simd;
+    Serial.println("core   -> PIE int4 (head_dot96_s4, dot128_s4; down padded to 96)");
+#else
     if (!core_simd_check()) {
       Serial.println("FATAL: simd core selftest failed");
       while (1) delay(1000);
     }
     model.layer_matvec = matvec_core_simd;
     Serial.println("core   -> PIE int8 (dot96, dot128, dot80)");
+#endif
 #else
     model.layer_matvec = matvec_par;
 #endif

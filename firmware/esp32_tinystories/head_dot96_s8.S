@@ -204,3 +204,89 @@ llm_dot80_s8:
 .Ldot80_rows_end:
     retw.n
 .size llm_dot80_s8,.-llm_dot80_s8
+
+/* Packed int4 core kernel (int4-core), 128 columns.
+ *
+ *   void llm_dot128_s4(const uint8_t *w, const int8_t *x, int32_t *out, uint32_t rows);
+ *
+ * 64-byte rows = four chunks in the llm_head_dot96_s4 layout (chunk c byte k:
+ * low nibble = element 32c+k, high nibble = element 32c+16+k, two's
+ * complement), so out[r] = ACCX >> 4 exactly; |16 * dot| <= 16*128*8*127 fits
+ * the low 32 bits. q6 = 0xF0 mask, q7 = work, x[0..95] in q0..q5. Chunk 3
+ * needs x[96..127] and no register is free, so chunk 2's two MACs use the
+ * .ld.ip form to load x[96..111] into q5 and x[112..127] into q4 after reading
+ * them (q5 = x[80..95], q4 = x[64..79] for chunk 2), and chunk 3's two MACs
+ * restore x[64..79] / x[80..95] the same way for the next row. The extra loads
+ * are from x in SRAM. w and x 16-byte aligned; SAR clobbered.
+ * The 96-column core tensors, and down (66 columns, restaged with zero weights
+ * to 96), use llm_head_dot96_s4 itself.
+ */
+
+.section .iram1,"ax"
+.align 4
+.global llm_dot128_s4
+.type llm_dot128_s4,@function
+llm_dot128_s4:
+    entry a1,16
+    ee.vld.128.ip q0,a3,16
+    ee.vld.128.ip q1,a3,16
+    ee.vld.128.ip q2,a3,16
+    ee.vld.128.ip q3,a3,16
+    ee.vld.128.ip q4,a3,16
+    ee.vld.128.ip q5,a3,16      /* a3 now points at x[96] */
+    addi a10,a3,-32             /* x[64] */
+
+    movi a8,0xF0
+    slli a9,a8,8
+    or a8,a8,a9
+    slli a9,a8,16
+    or a8,a8,a9
+    ee.movi.32.q q6,a8,0
+    ee.movi.32.q q6,a8,1
+    ee.movi.32.q q6,a8,2
+    ee.movi.32.q q6,a8,3
+    ssai 4
+
+    loopnez a5,.Ldot128s4_rows_end
+    ee.zero.accx
+    mov a6,a10
+    mov a7,a3
+    /* chunk 0: 0..15 (lo) / 16..31 (hi) */
+    ee.vld.128.ip q7,a2,0
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx q1,q7
+    ee.vld.128.ip q7,a2,16
+    ee.vsl.32 q7,q7
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx q0,q7
+    /* chunk 1: 32..47 / 48..63 */
+    ee.vld.128.ip q7,a2,0
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx q3,q7
+    ee.vld.128.ip q7,a2,16
+    ee.vsl.32 q7,q7
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx q2,q7
+    /* chunk 2: 64..79 / 80..95; then q5 <- x[96..111], q4 <- x[112..127] */
+    ee.vld.128.ip q7,a2,0
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx.ld.ip q5,a7,16,q5,q7
+    ee.vld.128.ip q7,a2,16
+    ee.vsl.32 q7,q7
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx.ld.ip q4,a7,16,q4,q7
+    /* chunk 3: 96..111 (lo, q5) / 112..127 (hi, q4); then restore q4, q5 */
+    ee.vld.128.ip q7,a2,0
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx.ld.ip q4,a6,16,q4,q7
+    ee.vld.128.ip q7,a2,16
+    ee.vsl.32 q7,q7
+    ee.andq q7,q7,q6
+    ee.vmulas.s8.accx.ld.ip q5,a6,16,q5,q7
+    rur.accx_0 a8
+    srai a8,a8,4
+    s32i a8,a4,0
+    addi a4,a4,4
+.Ldot128s4_rows_end:
+    retw.n
+.size llm_dot128_s4,.-llm_dot128_s4
