@@ -105,6 +105,13 @@
 #error "INTERACTIVE needs VOCAB_EOT_ID: regenerate generated/vocab.h"
 #endif
 
+// Prompt positions before the last run every layer (their K/V are needed) but
+// not the output head: nothing reads those logits. 1 skips it; 0 computes it.
+// The last prompt position always computes logits, so no value changes.
+#ifndef PREFILL_SKIP
+#define PREFILL_SKIP 1
+#endif
+
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
@@ -700,6 +707,25 @@ static void blink(uint8_t g) {
 #endif
 }
 
+// One prompt position. With PREFILL_SKIP and !last, the head hook is swapped for
+// a no-op for this call only (llm_forward still applies out_norm to its own
+// scratch x, which the next call overwrites).
+#if PREFILL_SKIP
+static void head_skip(const QT *, const float *, float *) {}
+#endif
+static void forward_prompt(int tok, int pos, bool last) {
+#if PREFILL_SKIP
+  if (!last) {
+    void (*hm)(const QT *, const float *, float *) = model.head_matvec;
+    model.head_matvec = head_skip;
+    llm_forward(&model, tok, pos, &s);
+    model.head_matvec = hm;
+    return;
+  }
+#endif
+  llm_forward(&model, tok, pos, &s);
+}
+
 // Emit one token to every active output (serial always; panel when enabled).
 static void emit(int tok) {
   if (tok >= VOCAB_N) return;
@@ -720,7 +746,7 @@ static void emit(int tok) {
 // last position are the first generated token's.
 static void prefill(const int *ids, int n, int *pos) {
   for (int i = 0; i < n; i++)
-    llm_forward(&model, ids[i], (*pos)++, &s);
+    forward_prompt(ids[i], (*pos)++, i == n - 1);
 }
 
 #define IA_LINE_MAX 4096
@@ -744,7 +770,8 @@ static void ia_reset_kv() {
 }
 
 static void ia_ready_line() {
-  Serial.printf("R ready vocab=%d seq_len=%d\n", model.out_vocab, model.c.seq_len);
+  Serial.printf("R ready vocab=%d seq_len=%d prefill_skip=%d\n",
+                model.out_vocab, model.c.seq_len, PREFILL_SKIP);
 }
 
 // splitmix64: small, deterministic, seeded straight from s=.
@@ -1100,7 +1127,7 @@ void setup() {
   for (int i = 0; i < n_prompt; i++) {  // prime with the prompt
     tok = PROMPT_IDS[i];
     emit(tok);
-    llm_forward(&model, tok, pos++, &s);
+    forward_prompt(tok, pos++, i == n_prompt - 1);
   }
 
   llm_profile_reset(&s);
