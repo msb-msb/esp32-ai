@@ -270,13 +270,18 @@ fi
 extra_gates
 
 BUILD_PROPS=(--build-property "compiler.optimization_flags=$OPT_FLAGS")
+# DEFINES: extra -D flags for the sketch's C++ files, e.g. DEFINES="-DUSE_DISPLAY=0".
+# compiler.cpp.extra_flags is empty in Arduino-ESP32 core 3.3.10's platform.txt.
+if [ -n "${DEFINES:-}" ]; then
+  BUILD_PROPS+=(--build-property "compiler.cpp.extra_flags=$DEFINES")
+fi
 if [ -n "${APP_MAX_BYTES:-}" ]; then
   BUILD_PROPS+=(--build-property "upload.maximum_size=$APP_MAX_BYTES")
 fi
 
 # Compile and verify before writing either image: a build failure after the
 # model flash would leave new weights under old firmware.
-echo "=== compile $SKETCH ($OPT_FLAGS) ==="
+echo "=== compile $SKETCH ($OPT_FLAGS${DEFINES:+ $DEFINES}) ==="
 step 2 "compile $SKETCH" \
   arduino-cli compile --fqbn "$FQBN" \
   "${BUILD_PROPS[@]}" \

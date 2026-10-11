@@ -29,8 +29,12 @@
 #include "generated/vocab.h"
 
 // Set to 1 once a display is wired up - see display.h.
-// Leave 0 to run serial-only (no panel needed).
+// Leave 0 to run serial-only (no panel needed). Overridable at build time,
+// e.g. DEFINES="-DUSE_DISPLAY=0" scripts/deploy.sh tinystories: with no panel
+// attached, the I2C writes fail every token and cost wall time.
+#ifndef USE_DISPLAY
 #define USE_DISPLAY 1
+#endif
 #if USE_DISPLAY
 #include "display.h"
 #endif
