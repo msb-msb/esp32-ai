@@ -84,6 +84,27 @@
 #error "CORE_INT4 extends the CORE_SIMD path and reuses the int4 head kernel"
 #endif
 
+// Interactive serial mode (host side: scripts/insiderllm/chat.py on the tools
+// branch). 0 keeps the fixed benchmark run in setup(). 1 skips it and serves a
+// line protocol on the native USB serial:
+//   host -> board  "P <id> <id> ...\n"                     prompt token ids
+//                  "G n=<N> t=<temp> p=<top_p> s=<seed> eot=<0|1>\n"
+//                  "?\n"                                    ready check
+//   board -> host  "T <id>"  per generated token, then
+//                  "D ttft_us=<..> decode_ms_per_tok=<..> n=<..>"
+//                  "R ready ..." at boot and on "?", "E <reason>" on a bad line
+// Each G runs the stored prompt from position 0 (one-shot, no multi-turn
+// state). t=0 is the benchmark's argmax loop; t>0 samples with temperature and
+// top-p from a PRNG seeded by s. TTFT is G line received -> first T line,
+// decode_ms_per_tok is llm_forward time per generated token as in the
+// benchmark's throughput line.
+#ifndef INTERACTIVE
+#define INTERACTIVE 0
+#endif
+#if INTERACTIVE && !defined(VOCAB_EOT_ID)
+#error "INTERACTIVE needs VOCAB_EOT_ID: regenerate generated/vocab.h"
+#endif
+
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
@@ -693,7 +714,227 @@ static void emit(int tok) {
 #endif
 }
 
+#if INTERACTIVE
+// ---- interactive serial mode ---------------------------------------------------
+// Prime the KV cache with ids[0..n), positions *pos onward. The logits of the
+// last position are the first generated token's.
+static void prefill(const int *ids, int n, int *pos) {
+  for (int i = 0; i < n; i++)
+    llm_forward(&model, ids[i], (*pos)++, &s);
+}
+
+#define IA_LINE_MAX 4096
+#define IA_CAND_MAX 1024
+static bool ia_ready = false;
+static int ia_prompt[1024];
+static int ia_n_prompt = 0;
+static char ia_line[IA_LINE_MAX];
+static int ia_len = 0;
+static bool ia_overflow = false;
+static uint64_t ia_rng;
+static float ia_cand[IA_CAND_MAX];
+
+// Zero the KV cache. Attention only reads positions 0..pos, which each run
+// rewrites before reading, so this changes no value; it keeps one run's state
+// from ever reaching the next. Runs on P and after each D, outside any TTFT.
+static void ia_reset_kv() {
+  size_t n = (size_t)model.c.n_layers * model.c.seq_len * model.c.dim * sizeof(float);
+  memset(s.kcache, 0, n);
+  memset(s.vcache, 0, n);
+}
+
+static void ia_ready_line() {
+  Serial.printf("R ready vocab=%d seq_len=%d\n", model.out_vocab, model.c.seq_len);
+}
+
+// splitmix64: small, deterministic, seeded straight from s=.
+static uint64_t ia_next() {
+  uint64_t z = (ia_rng += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+static float ia_uniform() {   // [0, 1), 24 bits
+  return (float)(ia_next() >> 40) * (1.0f / 16777216.0f);
+}
+
+static int ia_cmp_desc(const void *a, const void *b) {
+  float x = *(const float *)a, y = *(const float *)b;
+  return (x < y) - (x > y);
+}
+
+// Sum and count of the weights >= c.
+static float ia_mass(const float *p, int V, float c, int *count) {
+  float m = 0.f;
+  int k = 0;
+  for (int v = 0; v < V; v++)
+    if (p[v] >= c) { m += p[v]; k++; }
+  if (count) *count = k;
+  return m;
+}
+
+// Temperature + top-p over the logits (overwritten with the unnormalized
+// weights exp((l - max) / t)). The nucleus is every token whose weight is at
+// least tau, the smallest weight of the top tokens that reach top_p of the
+// total; the draw walks it in id order, so no full sort is needed.
+static int ia_sample(float *l, int V, float temp, float top_p) {
+  float mx = l[0];
+  for (int v = 1; v < V; v++) if (l[v] > mx) mx = l[v];
+  float inv = 1.f / temp, Z = 0.f;
+  for (int v = 0; v < V; v++) { l[v] = expf((l[v] - mx) * inv); Z += l[v]; }
+  float tau = 0.f;
+  if (top_p < 1.f) {
+    float target = top_p * Z, c = 0.5f;
+    int cnt = 0;
+    // Lower the cutoff 16x at a time until the weights above it reach target.
+    while (ia_mass(l, V, c, &cnt) < target && c > 1e-30f) c *= 0.0625f;
+    if (cnt <= IA_CAND_MAX) {
+      int k = 0;
+      for (int v = 0; v < V; v++) if (l[v] >= c) ia_cand[k++] = l[v];
+      qsort(ia_cand, k, sizeof(float), ia_cmp_desc);
+      float acc = 0.f;
+      tau = ia_cand[k - 1];
+      for (int i = 0; i < k; i++) {
+        acc += ia_cand[i];
+        if (acc >= target) { tau = ia_cand[i]; break; }
+      }
+    } else {
+      // Flat distribution: bisect for the largest cutoff that still reaches it.
+      float lo = c, hi = c * 16.f;
+      for (int it = 0; it < 32; it++) {
+        float mid = 0.5f * (lo + hi);
+        if (ia_mass(l, V, mid, NULL) >= target) lo = mid; else hi = mid;
+      }
+      tau = lo;
+    }
+  }
+  float tot = ia_mass(l, V, tau, NULL);
+  float r = ia_uniform() * tot, acc = 0.f;
+  int last = 0;
+  for (int v = 0; v < V; v++)
+    if (l[v] >= tau) {
+      acc += l[v];
+      last = v;
+      if (acc > r) return v;
+    }
+  return last;
+}
+
+static void ia_cmd_prompt(char *p) {
+  int n = 0;
+  char *end;
+  for (;;) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    long id = strtol(p, &end, 10);
+    if (end == p || (*end && *end != ' ')) { Serial.println("E bad prompt id"); ia_n_prompt = 0; return; }
+    if (id < 0 || id >= model.out_vocab) {
+      Serial.printf("E prompt id %ld out of range 0..%d\n", id, model.out_vocab - 1);
+      ia_n_prompt = 0; return;
+    }
+    if (n >= model.c.seq_len || n >= (int)(sizeof(ia_prompt) / sizeof(ia_prompt[0]))) {
+      Serial.printf("E prompt longer than seq_len %d\n", model.c.seq_len);
+      ia_n_prompt = 0; return;
+    }
+    ia_prompt[n++] = (int)id;
+    p = end;
+  }
+  if (n == 0) { Serial.println("E empty prompt"); ia_n_prompt = 0; return; }
+  ia_n_prompt = n;
+  ia_reset_kv();
+}
+
+static void ia_cmd_generate(char *p, int64_t t_g) {
+  long n = 200, eot = 0;
+  float temp = 0.f, top_p = 1.f;
+  unsigned long long seed = 0;
+  for (char *kv = strtok(p, " "); kv; kv = strtok(NULL, " ")) {
+    char *eq = strchr(kv, '=');
+    if (!eq) { Serial.printf("E bad field %s\n", kv); return; }
+    *eq = 0;
+    const char *v = eq + 1;
+    if (!strcmp(kv, "n")) n = strtol(v, NULL, 10);
+    else if (!strcmp(kv, "t")) temp = strtof(v, NULL);
+    else if (!strcmp(kv, "p")) top_p = strtof(v, NULL);
+    else if (!strcmp(kv, "s")) seed = strtoull(v, NULL, 10);
+    else if (!strcmp(kv, "eot")) eot = strtol(v, NULL, 10);
+    else { Serial.printf("E unknown field %s\n", kv); return; }
+  }
+  if (ia_n_prompt == 0) { Serial.println("E no prompt (send P first)"); return; }
+  if (n < 1) { Serial.println("E n must be >= 1"); return; }
+  if (ia_n_prompt + n > model.c.seq_len) {
+    Serial.printf("E prompt %d + n %ld > seq_len %d\n", ia_n_prompt, n, model.c.seq_len);
+    return;
+  }
+  if (!(temp >= 0.f) || !(top_p > 0.f && top_p <= 1.f)) {
+    Serial.println("E need t >= 0 and 0 < p <= 1"); return;
+  }
+  ia_rng = seed;
+
+  int pos = 0, tok = 0, decoded = 0;
+  int64_t decode_us = 0, ttft_us = -1;
+  prefill(ia_prompt, ia_n_prompt, &pos);
+  llm_profile_reset(&s);
+  for (int step = 0; step < n && pos < model.c.seq_len; step++) {
+    if (temp == 0.f) {   // the benchmark's argmax, unchanged
+      int best = 0; float bv = -1e30f;
+      for (int v = 0; v < model.out_vocab; v++)
+        if (s.logits[v] > bv) { bv = s.logits[v]; best = v; }
+      tok = best;
+    } else {
+      tok = ia_sample(s.logits, model.out_vocab, temp, top_p);
+    }
+    if (eot && tok == VOCAB_EOT_ID) break;
+    if (ttft_us < 0) ttft_us = esp_timer_get_time() - t_g;
+    Serial.printf("T %d\n", tok);
+    blink((step & 1) ? 40 : 8);
+
+    int64_t d0 = esp_timer_get_time();
+    llm_forward(&model, tok, pos++, &s);
+    decode_us += esp_timer_get_time() - d0;
+    decoded++;
+    if ((step & 7) == 0) delay(0);  // feed the task WDT ~every 8 tokens
+  }
+  Serial.printf("D ttft_us=%lld decode_ms_per_tok=%.3f n=%d\n", (long long)ttft_us,
+                decoded ? decode_us / 1000.0 / decoded : 0.0, decoded);
+  blink(0);
+  ia_reset_kv();
+}
+
+static void ia_handle(char *line, int64_t t_rx) {
+  int n = strlen(line);
+  while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
+  if (n == 0) return;
+  if (!ia_ready) { Serial.println("E not ready (boot failed)"); return; }
+  if (line[0] == 'P' && (line[1] == ' ' || !line[1])) ia_cmd_prompt(line + 1);
+  else if (line[0] == 'G' && (line[1] == ' ' || !line[1])) ia_cmd_generate(line + 1, t_rx);
+  else if (line[0] == '?' && !line[1]) ia_ready_line();
+  else Serial.println("E unknown command");
+}
+
+static void ia_poll() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\n') {
+      int64_t t = esp_timer_get_time();
+      ia_line[ia_len] = 0;
+      if (ia_overflow) Serial.printf("E line longer than %d bytes\n", IA_LINE_MAX - 1);
+      else ia_handle(ia_line, t);
+      ia_len = 0; ia_overflow = false;
+    } else if (ia_len < IA_LINE_MAX - 1) {
+      ia_line[ia_len++] = (char)c;
+    } else {
+      ia_overflow = true;
+    }
+  }
+}
+#endif  // INTERACTIVE
+
 void setup() {
+#if INTERACTIVE
+  Serial.setRxBufferSize(IA_LINE_MAX);   // a whole P line fits while a run is busy
+#endif
   Serial.begin(115200);
   delay(1500);
   Serial.println("\n=== ESP32-S3 PLE TinyLM ===");
@@ -842,6 +1083,13 @@ void setup() {
                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024.0,
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1048576.0);
 
+#if INTERACTIVE
+  ia_reset_kv();
+  ia_ready = true;
+  ia_ready_line();
+  return;
+#endif
+
   // ---- generate ----
   Serial.print(">>> ");
   int n_prompt = sizeof(PROMPT_IDS) / sizeof(int);
@@ -894,4 +1142,11 @@ void setup() {
   blink(0);
 }
 
-void loop() { delay(10000); }
+void loop() {
+#if INTERACTIVE
+  ia_poll();
+  delay(1);
+#else
+  delay(10000);
+#endif
+}
