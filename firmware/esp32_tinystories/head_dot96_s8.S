@@ -126,3 +126,81 @@ llm_head_dot96_s4:
 .Lhead4_rows_end:
     retw.n
 .size llm_head_dot96_s4,.-llm_head_dot96_s4
+
+/* Core-matvec kernels (simd-core). Same contract as llm_head_dot96_s8: exact
+ * int32 row dots of int8 weights against int8 x, w and x 16-byte aligned,
+ * q0..q7 and ACCX scratch. llm_head_dot96_s8 itself serves every 96-column
+ * core tensor.
+ *
+ *   void llm_dot128_s8(const int8_t *w, const int8_t *x, int32_t *out, uint32_t rows);
+ *     128 columns, row stride 128. x[0..95] stay in q0..q5; x[96..127] are
+ *     reloaded from x (SRAM) for every row, since the row needs both q6 and q7.
+ *
+ *   void llm_dot80_s8(const int8_t *w, const int8_t *x, int32_t *out, uint32_t rows);
+ *     80-byte rows (a 66-column tensor restaged with zero padding to 80). The
+ *     padding weights are zero, so x[66..79] may hold anything.
+ */
+
+.section .iram1,"ax"
+.align 4
+.global llm_dot128_s8
+.type llm_dot128_s8,@function
+llm_dot128_s8:
+    entry a1,16
+    ee.vld.128.ip q0,a3,16
+    ee.vld.128.ip q1,a3,16
+    ee.vld.128.ip q2,a3,16
+    ee.vld.128.ip q3,a3,16
+    ee.vld.128.ip q4,a3,16
+    ee.vld.128.ip q5,a3,16      /* a3 now points at x[96] */
+
+    loopnez a5,.Ldot128_rows_end
+    ee.zero.accx
+    mov a7,a3
+    ee.vld.128.ip q6,a2,16
+    ee.vld.128.ip q7,a2,16
+    ee.vmulas.s8.accx.ld.ip q6,a2,16,q0,q6
+    ee.vmulas.s8.accx.ld.ip q7,a2,16,q1,q7
+    ee.vmulas.s8.accx.ld.ip q6,a2,16,q2,q6
+    ee.vmulas.s8.accx.ld.ip q7,a2,16,q3,q7
+    ee.vmulas.s8.accx.ld.ip q6,a2,16,q4,q6   /* q6 <- w[96..111] */
+    ee.vmulas.s8.accx q5,q7
+    ee.vld.128.ip q7,a7,16                   /* x[96..111] */
+    ee.vmulas.s8.accx q6,q7
+    ee.vld.128.ip q6,a2,16                   /* w[112..127] */
+    ee.vld.128.ip q7,a7,16                   /* x[112..127] */
+    ee.vmulas.s8.accx q6,q7
+    rur.accx_0 a8
+    s32i a8,a4,0
+    addi a4,a4,4
+.Ldot128_rows_end:
+    retw.n
+.size llm_dot128_s8,.-llm_dot128_s8
+
+.section .iram1,"ax"
+.align 4
+.global llm_dot80_s8
+.type llm_dot80_s8,@function
+llm_dot80_s8:
+    entry a1,16
+    ee.vld.128.ip q0,a3,16
+    ee.vld.128.ip q1,a3,16
+    ee.vld.128.ip q2,a3,16
+    ee.vld.128.ip q3,a3,16
+    ee.vld.128.ip q4,a3,16
+
+    loopnez a5,.Ldot80_rows_end
+    ee.zero.accx
+    ee.vld.128.ip q6,a2,16
+    ee.vld.128.ip q7,a2,16
+    ee.vmulas.s8.accx.ld.ip q6,a2,16,q0,q6
+    ee.vmulas.s8.accx.ld.ip q7,a2,16,q1,q7
+    ee.vmulas.s8.accx.ld.ip q6,a2,16,q2,q6
+    ee.vmulas.s8.accx q3,q7
+    ee.vmulas.s8.accx q4,q6
+    rur.accx_0 a8
+    s32i a8,a4,0
+    addi a4,a4,4
+.Ldot80_rows_end:
+    retw.n
+.size llm_dot80_s8,.-llm_dot80_s8

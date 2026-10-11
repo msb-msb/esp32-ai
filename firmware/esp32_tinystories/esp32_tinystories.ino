@@ -60,6 +60,14 @@
 #ifndef HEAD_INT4
 #define HEAD_INT4 1
 #endif
+// Core (non-head) int8 matvecs on PIE: the int32 row dots only; quantization,
+// the dual-core split and every float op are unchanged. 0 keeps matvec_par.
+#ifndef CORE_SIMD
+#define CORE_SIMD 1
+#endif
+#if CORE_SIMD && !HEAD_SIMD
+#error "CORE_SIMD uses the HEAD_SIMD worker plumbing and kernels"
+#endif
 
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
@@ -305,6 +313,150 @@ static bool head_simd_check(const QT *t) {
   return bad == 0;
 }
 #endif  // HEAD_INT4
+
+#if CORE_SIMD
+// ---- SIMD core matvecs --------------------------------------------------------
+// Same arithmetic as matvec_par / matvec_q8 for one-group tensors: the int32
+// row dots come from PIE kernels (exact), the float tail is the same
+// expression, the >=128-row dual-core split is the same.
+extern "C" void llm_dot128_s8(const int8_t *w, const int8_t *x, int32_t *out,
+                              uint32_t rows);
+extern "C" void llm_dot80_s8(const int8_t *w, const int8_t *x, int32_t *out,
+                             uint32_t rows);
+#define DOWN_PAD_COLS 80
+static const int8_t *down_pad[LLM_MAX_LAYERS];   // 66-col down rows, zero-padded to 80
+
+enum { K_DOT96, K_DOT128, K_DOT80, K_NONE };
+static const char *const kernel_name[] = {"dot96", "dot128", "dot80", "none"};
+
+static int core_kernel(const QT *t) {
+  if (t->w8 == NULL || t->n_groups != 1) return K_NONE;
+  if (t->cols == 96) return K_DOT96;
+  if (t->cols == 128) return K_DOT128;
+  if (t->cols == 66) {
+    for (int l = 0; l < model.c.n_layers; l++)
+      if (t == &model.down[l]) return down_pad[l] ? K_DOT80 : K_NONE;
+  }
+  return K_NONE;
+}
+
+// Exact int32 dots of rows [r0, r0+n) of t, n <= HEAD_BLOCK.
+static void core_dots(const QT *t, int k, const int8_t *xq, int32_t *d, int r0, int n) {
+  switch (k) {
+    case K_DOT96:  llm_head_dot96_s8(t->w8 + (size_t)r0 * 96, xq, d, (uint32_t)n); break;
+    case K_DOT128: llm_dot128_s8(t->w8 + (size_t)r0 * 128, xq, d, (uint32_t)n); break;
+    default: {
+      int l = 0;
+      while (t != &model.down[l]) l++;
+      llm_dot80_s8(down_pad[l] + (size_t)r0 * DOWN_PAD_COLS, xq, d, (uint32_t)n);
+    }
+  }
+}
+
+static void core_i8_range_simd(const QT *t, const int8_t *xq, float x_scale,
+                               float *y, int row_begin, int row_end) {
+  int k = core_kernel(t);
+  int32_t d[HEAD_BLOCK];
+  for (int r0 = row_begin; r0 < row_end; r0 += HEAD_BLOCK) {
+    int n = row_end - r0 < HEAD_BLOCK ? row_end - r0 : HEAD_BLOCK;
+    core_dots(t, k, xq, d, r0, n);
+    for (int i = 0; i < n; i++) {
+      float acc = 0.f;
+      acc += (float)d[i] * t->scale8[r0 + i];
+      y[r0 + i] = acc * x_scale;
+    }
+  }
+}
+
+static void matvec_core_simd(const QT *t, const float *x, float *y) {
+  static int8_t xq[LLM_Q8_MAX_INPUT] __attribute__((aligned(16)));
+  float xs;
+  if (core_kernel(t) == K_NONE) { matvec_par(t, x, y); return; }   // not expected
+  quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
+  if (t->rows < 128) { core_i8_range_simd(t, xq, xs, y, 0, t->rows); return; }
+  job_fn = core_i8_range_simd;
+  job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
+  xTaskNotifyGive(worker_h);
+  core_i8_range_simd(t, xq, xs, y, job_split, t->rows);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
+static void *ps_aligned16(size_t n) {
+  void *p = heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM);
+  if (p) psram_used += n;
+  return p;
+}
+
+// Zero-padded 80-byte-stride copies of each layer's 66-column down matrix.
+static void stage_down_pad() {
+  for (int l = 0; l < model.c.n_layers; l++) {
+    const QT *t = &model.down[l];
+    size_t n = (size_t)t->rows * DOWN_PAD_COLS;
+    int8_t *p = (int8_t *)ps_aligned16(n);
+    if (!p) {
+      Serial.printf("FATAL: required PSRAM allocation failed: down pad (%u bytes)\n",
+                    (unsigned)n);
+      while (1) delay(1000);
+    }
+    memset(p, 0, n);
+    for (int r = 0; r < t->rows; r++)
+      memcpy(p + (size_t)r * DOWN_PAD_COLS, t->w8 + (size_t)r * t->cols, t->cols);
+    down_pad[l] = p;
+  }
+}
+
+// Every row of every core tensor through its kernel against llm_dot_i8, on a
+// fixed activation with both int8 extremes and non-zero bytes past column 66.
+static bool core_simd_check() {
+  static int8_t xt[128] __attribute__((aligned(16)));
+  for (int j = 0; j < 128; j++)
+    xt[j] = (j % 3 == 0) ? 127 : (j % 3 == 1) ? -127 : (int8_t)(j * 37 - 90);
+  const QT *ts[1 + 7 * LLM_MAX_LAYERS];
+  int nt = 0;
+  ts[nt++] = &model.ple_model_proj;
+  for (int l = 0; l < model.c.n_layers; l++) {
+    ts[nt++] = &model.qkv[l];  ts[nt++] = &model.attn_proj[l];
+    ts[nt++] = &model.gate[l]; ts[nt++] = &model.up[l];  ts[nt++] = &model.down[l];
+    ts[nt++] = &model.ple_gate[l]; ts[nt++] = &model.ple_proj[l];
+  }
+  int rows[3] = {0, 0, 0}, bad[3] = {0, 0, 0};
+  for (int i = 0; i < nt; i++) {
+    const QT *t = ts[i];
+    int k = core_kernel(t);
+    if (k == K_NONE) {
+      Serial.printf("FATAL: no SIMD kernel for core tensor %d (%dx%d, groups=%d, w8=%p)\n",
+                    i, t->rows, t->cols, t->n_groups, t->w8);
+      return false;
+    }
+    const int8_t *base = (k == K_DOT80) ? NULL : t->w8;
+    if (base && ((uintptr_t)base & 15) != 0) {
+      Serial.printf("FATAL: core tensor %d not 16-byte aligned (%p)\n", i, base);
+      return false;
+    }
+    int32_t d[HEAD_BLOCK];
+    for (int r0 = 0; r0 < t->rows; r0 += HEAD_BLOCK) {
+      int n = t->rows - r0 < HEAD_BLOCK ? t->rows - r0 : HEAD_BLOCK;
+      core_dots(t, k, xt, d, r0, n);
+      for (int r = 0; r < n; r++) {
+        int32_t ref = llm_dot_i8(t->w8 + (size_t)(r0 + r) * t->cols, xt, t->cols);
+        if (d[r] != ref) {
+          if (bad[k] < 4) Serial.printf("simd core mismatch: %s tensor %d row %d: %ld vs %ld\n",
+                                        kernel_name[k], i, r0 + r, (long)d[r], (long)ref);
+          bad[k]++;
+        }
+      }
+      rows[k] += n;
+    }
+  }
+  bool ok = true;
+  for (int k = 0; k < 3; k++) {
+    Serial.printf("simd core selftest: %s %d/%d rows %s\n", kernel_name[k],
+                  rows[k] - bad[k], rows[k], bad[k] ? "FAIL" : "ok");
+    if (bad[k]) ok = false;
+  }
+  return ok;
+}
+#endif  // CORE_SIMD
 #endif
 
 // Copy RMSNorm weights from mapped flash to internal SRAM.
@@ -412,11 +564,19 @@ void setup() {
 
   // Stage every per-position tensor to int8 in PSRAM.
   int want = llm_core_stage_count(&model);
+#if CORE_SIMD
+  // 16-byte aligned staging: ee.vld.128 reads each row in place.
+  int staged = llm_stage_core_int8_alloc(&model, ps_aligned16);
+#else
   int staged = llm_stage_core_int8_alloc(&model, ps);
+#endif
   if (staged != want) {
     Serial.printf("FATAL: staged %d/%d core tensors\n", staged, want);
     while (1) delay(1000);
   }
+#if CORE_SIMD
+  stage_down_pad();
+#endif
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs.
   {
@@ -457,7 +617,16 @@ void setup() {
   main_h = xTaskGetCurrentTaskHandle();
   if (xTaskCreatePinnedToCore(worker_main, "mv", 4096, NULL, 2, &worker_h, 0) == pdPASS) {
     // After the worker exists: matvec_par notifies worker_h.
+#if CORE_SIMD
+    if (!core_simd_check()) {
+      Serial.println("FATAL: simd core selftest failed");
+      while (1) delay(1000);
+    }
+    model.layer_matvec = matvec_core_simd;
+    Serial.println("core   -> PIE int8 (dot96, dot128, dot80)");
+#else
     model.layer_matvec = matvec_par;
+#endif
 #if HEAD_SIMD
     if (!head_simd_check(&model.out_head)) while (1) delay(1000);
     model.head_matvec  = matvec_par_head;
