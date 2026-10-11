@@ -39,6 +39,17 @@
 #include "display.h"
 #endif
 
+// Story boundary: <|endoftext|> (VOCAB_EOT_ID) decodes to zero bytes, so the
+// loop otherwise runs straight on into a new story. 1 stops the generation
+// there; 0 keeps the fixed-length loop (upstream behaviour, benchmark mode).
+// VOCAB_EOT_ID comes from tools/generate_vocab.py, which deploy.sh reruns.
+#ifndef STOP_AT_EOT
+#define STOP_AT_EOT 0
+#endif
+#if STOP_AT_EOT && !defined(VOCAB_EOT_ID)
+#error "STOP_AT_EOT needs VOCAB_EOT_ID: regenerate generated/vocab.h"
+#endif
+
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
@@ -275,6 +286,9 @@ void setup() {
     for (int v = 0; v < model.out_vocab; v++)
       if (s.logits[v] > bv) { bv = s.logits[v]; best = v; }
     tok = best;
+#if STOP_AT_EOT
+    if (tok == VOCAB_EOT_ID) break;  // end of story: stop instead of starting another
+#endif
     emit(tok);
     blink((step & 1) ? 40 : 8);
 
@@ -287,8 +301,9 @@ void setup() {
   int64_t total_us = esp_timer_get_time() - t_start;
 
   Serial.printf("\n\n--- %d tokens in %.2f s ---\n", decoded, total_us / 1e6);
-  Serial.printf("throughput: %.2f tok/s   (%.1f ms/token)\n",
-                decoded * 1e6 / total_us, decode_us / 1000.0 / decoded);
+  if (decoded)  // zero when the first generated token is the boundary
+    Serial.printf("throughput: %.2f tok/s   (%.1f ms/token)\n",
+                  decoded * 1e6 / total_us, decode_us / 1000.0 / decoded);
   if (s.profile.calls) {
     float n = (float)s.profile.calls * 1000.f;
     Serial.printf("profile ms/token: input %.1f | attn %.1f | ffn %.1f | ple %.1f | head %.1f\n",
@@ -297,7 +312,7 @@ void setup() {
                   s.profile.head_us / n);
   }
 #if USE_DISPLAY
-  display_stats(decoded * 1e6f / decode_us, decode_us / 1000.0f / decoded);
+  if (decoded) display_stats(decoded * 1e6f / decode_us, decode_us / 1000.0f / decoded);
 #endif
   blink(0);
 }
