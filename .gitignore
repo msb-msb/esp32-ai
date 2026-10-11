@@ -24,3 +24,6 @@ videos/
 *.mov
 *.MOV
 *.MP4
+
+# scripts/insiderllm/build_variant.sh build directories
+/build/insiderllm/
