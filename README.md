@@ -45,12 +45,17 @@ prompt "Once upon a time". All three runs printed identical values.
 | + `int4-head` | 24.1 | 35.5 | 59.6 | 16.21 | `4400a1cbf4a5137d` |
 | + `simd-core` | 24.1 | 26.4 | 50.4 | 19.05 | `4400a1cbf4a5137d` |
 | + `logits-sram` | 21.2 | 26.3 | 47.5 | 20.62 | `4400a1cbf4a5137d` |
-| **+ `int4-core`** (= `insiderllm`) | **21.2** | **22.0** | **43.3** | **22.59** | **`4400a1cbf4a5137d`** |
+| **+ `int4-core`** | **21.2** | **22.0** | **43.3** | **22.59** | **`4400a1cbf4a5137d`** |
+| `insiderllm` branch, fresh clone, built with the commands below | 21.2 | 22.0 | 43.2 | 22.61 | `4400a1cbf4a5137d` |
 
-- **Upstream's figure:** upstream publishes 94.9 ms/token and 9.88 tok/s with a display attached.
+- **Where the rows come from:** the first six were measured as patches on a copy of upstream (the bench
+  records). The last row is this branch built from a fresh clone, with its profile and output identical to the
+  `int4-core` row. The 0.1 ms difference was not investigated.
+- **Upstream's figure:** 94.9 ms/token of compute and 9.88 tok/s, labelled "attached serial" in
+  `firmware/esp32_tinystories/README.md` ("9.88 tok/s attached" in RESULTS.md).
 - **The other three branches** don't change these numbers: `eot-stop` and `interactive` are off by default, and
   `prefill-skip` only touches prompt positions, which are outside the timed loop.
-- **Other clocks:** at 160 and 80 MHz, `insiderllm` measures 49.5 and 69.5 ms/token.
+- **Other clocks:** at 160 and 80 MHz, the `int4-core` build measured 49.5 and 69.5 ms/token.
 - **What remains:** the head and the core now sit at roughly 62 MB/s of PSRAM traffic, so what's left is memory
   traffic, not compute.
 
@@ -88,7 +93,7 @@ the boot log should read:
 
 ```
 --- 200 tokens in 8.85 s ---
-throughput: 22.59 tok/s   (43.3 ms/token)
+throughput: 22.61 tok/s   (43.2 ms/token)
 profile ms/token: input 1.0 | attn 16.1 | ffn 2.4 | ple 2.5 | head 21.2
 ```
 
