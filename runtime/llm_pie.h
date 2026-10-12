@@ -73,9 +73,14 @@ static inline void llm_pie4_prepare(const int8_t *xq, int cols, int group,
   }
 }
 
+// [insiderllm-p4] The kernel's width is the staged row's, stride4 * 2 columns: equal to
+// cols for a tensor whose packed rows are copied as they are, and larger for a row
+// padded with zero-weight codes (8) to a multiple of 32 (FFN down: 66 -> 96).
+static inline int llm_pie4_cols(const QT *t) { return t->stride4 * 2; }
+
 static inline void llm_pie4_row(const QT *t, const int8_t *xperm, const int32_t *xsum8,
                                 float x_scale, float *y, int r) {
-  int g = t->group, ng = t->n_groups, cols = t->cols;
+  int g = t->group, ng = t->n_groups, cols = llm_pie4_cols(t);
   const uint8_t *w = t->w4 + (size_t)r * t->stride4;
   const float *sc = t->scale8 + (size_t)r * ng;
   float acc = 0.f;
@@ -126,7 +131,7 @@ static void matvec_pie4_range(const QT *t, const int8_t *xperm, const int32_t *x
 }
 
 static inline int llm_pie4_ok(const QT *t) {
-  return t->w4 != NULL && (t->cols % 32) == 0 && (t->group % 32) == 0 &&
+  return t->w4 != NULL && (llm_pie4_cols(t) % 32) == 0 && (t->group % 32) == 0 &&
          (((uintptr_t)t->w4) & 15) == 0 && (t->stride4 % 16) == 0;
 }
 

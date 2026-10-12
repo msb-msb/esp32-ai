@@ -273,7 +273,13 @@ static float quantize_shared(const QT *t, const float *x) {
   quantize_act(x, t->cols, xq_shared, &xs);
   for (int j = t->cols; j < t->stride8; j++) xq_shared[j] = 0;
 #if LLM_HAVE_PIE
-  if (t->w4) llm_pie4_prepare(xq_shared, t->cols, t->group, xperm_shared, xsum8_shared);
+  // [insiderllm-p4] int4 rows may be padded past cols (zero-weight codes); the
+  // padded activations must be 0 so the 8*sum(x) correction stays exact.
+  if (t->w4) {
+    int c4 = llm_pie4_cols(t);
+    for (int j = t->cols; j < c4; j++) xq_shared[j] = 0;
+    llm_pie4_prepare(xq_shared, c4, t->group, xperm_shared, xsum8_shared);
+  }
 #endif
   return xs;
 }
@@ -542,6 +548,70 @@ static void tell_story_ids(const uint16_t *ids, int n) {
 // to 256, so a longer paste would overrun it before loop() drains it.
 #define SERIAL_RX_BYTES (2 * BTK_MAX_INPUT_BYTES)
 
+// ---- [insiderllm-p4] int4 core weights (P4_CORE_INT4) -------------------------
+// The idea of our S3 int4-core patch on the PR's P4 int4 kernel (llm_pie4_*): every
+// core tensor keeps its packed int4 codes in PSRAM and is unpacked in registers,
+// half the bytes of the int8 staging. Rows already a multiple of 32 columns are the
+// file's codes as they are; FFN down (66 columns, 33-byte rows) is padded to 96
+// columns with code 8 (weight 0). The int8 staging stays allocated for its scales
+// (scale8, same values), as on the S3. Self-test: every row of every core tensor,
+// two activation patterns, bit-compared with matvec_q8_range on the flash codes.
+#ifndef P4_CORE_INT4
+#define P4_CORE_INT4 0
+#endif
+#if P4_CORE_INT4 && LLM_HAVE_PIE
+static int core_tensors(QT **out) {
+  int n = 0;
+  out[n++] = &model.ple_model_proj;
+  for (int l = 0; l < model.c.n_layers; l++) {
+    out[n++] = &model.qkv[l];  out[n++] = &model.attn_proj[l];
+    out[n++] = &model.gate[l]; out[n++] = &model.up[l];
+    out[n++] = &model.down[l]; out[n++] = &model.ple_gate[l];
+    out[n++] = &model.ple_proj[l];
+  }
+  return n;
+}
+static size_t core4_bytes = 0;
+static bool stage_core_int4(QT *t) {
+  int c4 = (t->cols + 31) / 32 * 32, rb4 = c4 / 2;
+  if (t->cols % 2 || t->group % 32 || t->scale8 == NULL) return false;
+  uint8_t *w = (uint8_t *)ps((size_t)t->rows * rb4);
+  if (!w) return false;
+  for (int r = 0; r < t->rows; r++) {
+    uint8_t *d = w + (size_t)r * rb4;
+    memcpy(d, t->codes + (size_t)r * t->row_bytes, t->row_bytes);
+    memset(d + t->row_bytes, 0x88, rb4 - t->row_bytes);   // code 8 = weight 0
+  }
+  t->w4 = w; t->stride4 = rb4;                              // scale8 kept from int8 staging
+  core4_bytes += (size_t)t->rows * rb4;
+  return llm_pie4_ok(t);
+}
+static bool core_int4_selftest() {
+  static QT *ts[1 + 7 * 32];
+  static float x[LLM_Q8_MAX_INPUT], ref[1024], got[1024];
+  int n = core_tensors(ts); long rows_ok = 0, rows_all = 0;
+  for (int pat = 0; pat < 2; pat++) {
+    for (int c = 0; c < n; c++) {
+      QT *t = ts[c];
+      for (int j = 0; j < t->cols; j++)
+        x[j] = pat ? sinf(0.37f * j + c) * 1.7f : ((j & 1) ? 1.f : -1.f);   // pattern 0: xq = +-127
+      float xs = quantize_shared(t, x);
+      // Both kernels write y[r] by absolute row; every core tensor has <= 768 rows.
+      if (t->rows > 1024) { Serial.printf("int4 core selftest: tensor %d has %d rows\n", c, t->rows); return false; }
+      matvec_q8_range(t, xq_shared, xs, ref, 0, t->rows);
+      matvec_pie4_range(t, xperm_shared, xsum8_shared, xs, got, 0, t->rows);
+      for (int r = 0; r < t->rows; r++) {
+        rows_all++;
+        if (memcmp(&ref[r], &got[r], sizeof(float)) == 0) rows_ok++;
+      }
+    }
+  }
+  Serial.printf("int4 core selftest: %ld/%ld rows bit-identical (%d tensors x 2 patterns) -> %s\n",
+                rows_ok, rows_all, n, rows_ok == rows_all ? "ok" : "FAIL");
+  return rows_ok == rows_all;
+}
+#endif
+
 void setup() {
   // Must be requested before begin(); a failed request falls back to 256.
   size_t rx_bytes = Serial.setRxBufferSize(SERIAL_RX_BYTES);
@@ -605,6 +675,16 @@ void setup() {
     Serial.printf("FATAL: staged %d/%d core tensors\n", staged, want);
     while (1) delay(1000);
   }
+#if P4_CORE_INT4 && LLM_HAVE_PIE
+  {
+    static QT *ts[1 + 7 * 32];
+    int n = core_tensors(ts), n4 = 0;
+    for (int c = 0; c < n; c++) n4 += stage_core_int4(ts[c]);
+    Serial.printf("int4 core -> PSRAM %d/%d tensors, %u B packed (down padded 66 -> 96)\n",
+                  n4, n, (unsigned)core4_bytes);
+    if (n4 != n) { Serial.println("FATAL: int4 core staging"); while (1) delay(1000); }
+  }
+#endif
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs. With the vector
   // unit it stays int4 and is unpacked in registers: the head is bound by
@@ -628,6 +708,9 @@ void setup() {
 
 #if LLM_HAVE_PIE
   if (!pie_self_check()) { Serial.println("FATAL: PIE kernel disagrees with scalar"); return; }
+#if P4_CORE_INT4
+  if (!core_int4_selftest()) { Serial.println("FATAL: int4 core kernel disagrees with scalar"); return; }
+#endif
 #endif
 
   main_h = xTaskGetCurrentTaskHandle();
