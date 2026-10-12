@@ -35,7 +35,13 @@
 #if CONFIG_IDF_TARGET_ESP32P4
 #define LLM_STAGE_ALIGN 16
 // Attention on the quantized KV cache, with both passes as PIE vector dots.
+// [pr24-repro-01 harness] PR24_KV_QUANT=0 keeps the exact fp32 KV path instead.
+#ifndef PR24_KV_QUANT
+#define PR24_KV_QUANT 1
+#endif
+#if PR24_KV_QUANT
 #define LLM_KV_QUANT 1
+#endif
 #include "../../runtime/llm_pie_dot.h"
 #define LLM_DOT_S8V  llm_pie_dot_s8v
 #define LLM_DOT_S16V llm_pie_dot_s16v
@@ -109,8 +115,34 @@ static const int N_GENERATE = 200;
 #define EOT_ID 0
 // Sampling, the same scheme as TinyLM.generate() in src/model.py. TEMPERATURE 0
 // selects greedy decoding, which reproduces the original fixed-prompt demo.
+// [pr24-repro-01 harness] PR24_BENCH=1: at boot, run upstream's compiled prompt
+// ("Once upon a time" = 433 447 259 405) for 200 greedy tokens without the EOT
+// stop, as in upstream's fixed benchmark; then serve typed prompts as usual.
+// 0 (default) is the PR unchanged.
+#ifndef PR24_BENCH
+#define PR24_BENCH 0
+#endif
+#if PR24_BENCH
+static const float TEMPERATURE = 0.f;
+static const int PROMPT_IDS[] = {433, 447, 259, 405};
+#else
 static const float TEMPERATURE = 0.8f;
+#endif
 static const int TOP_K = 40;
+// [pr24-repro-01 harness] -DLOGIT_CHECKSUM=1: FNV-1a 64 of the raw logits behind
+// each of the first 20 generated tokens, as in our S3 logit-checksum patch.
+#ifndef LOGIT_CHECKSUM
+#define LOGIT_CHECKSUM 0
+#endif
+#if LOGIT_CHECKSUM
+#define LOGIT_CHECKSUM_TOKENS 20
+static uint64_t logit_hash[LOGIT_CHECKSUM_TOKENS];
+static uint64_t fnv1a64(const void *p, size_t n, uint64_t h) {
+  const uint8_t *b = (const uint8_t *)p;
+  for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+  return h;
+}
+#endif
 
 static Model model;
 static Scratch s;
@@ -393,6 +425,7 @@ static int pick_token(const float *logits, int n) {
 }
 
 // ---- generation -------------------------------------------------------------
+static void tell_story_ids(const uint16_t *ids, int n);
 static void tell_story(const char *prompt) {
   uint16_t ids[BTK_MAX_INPUT_BYTES];
   int n = bpe_encode_ascii(&tokenizer, prompt, ids, BTK_MAX_INPUT_BYTES);
@@ -402,6 +435,9 @@ static void tell_story(const char *prompt) {
     Serial.printf("(prompt too long: %d tokens, max %d)\n", n, max_prompt);
     return;
   }
+  tell_story_ids(ids, n);
+}
+static void tell_story_ids(const uint16_t *ids, int n) {
 
   // Prime with the prompt. The KV cache is simply overwritten from position 0.
   Serial.print(">>> ");
@@ -416,8 +452,15 @@ static void tell_story(const char *prompt) {
   int64_t t_start = esp_timer_get_time(), decode_us = 0;
   int decoded = 0;
   for (int step = 0; step < N_GENERATE && pos < model.c.seq_len; step++) {
+#if LOGIT_CHECKSUM
+    if (step < LOGIT_CHECKSUM_TOKENS)
+      logit_hash[step] = fnv1a64(s.logits, (size_t)model.out_vocab * sizeof(float),
+                                 14695981039346656037ULL);
+#endif
     tok = pick_token(s.logits, model.out_vocab);
+#if !PR24_BENCH
     if (tok == EOT_ID) break;
+#endif
     emit(tok);
     blink((step & 1) ? 40 : 8);
 
@@ -443,6 +486,16 @@ static void tell_story(const char *prompt) {
                   s.profile.ffn_us / k, s.profile.ple_us / k,
                   s.profile.head_us / k);
   }
+#if LOGIT_CHECKSUM
+  {
+    int nh = decoded < LOGIT_CHECKSUM_TOKENS ? decoded : LOGIT_CHECKSUM_TOKENS;
+    for (int i = 0; i < nh; i++)
+      Serial.printf("logit_hash[%02d] %016llx\n", i, (unsigned long long)logit_hash[i]);
+    Serial.printf("logit_hash_all %016llx (n=%d)\n",
+                  (unsigned long long)fnv1a64(logit_hash, nh * sizeof(uint64_t),
+                                              14695981039346656037ULL), nh);
+  }
+#endif
 #if USE_DISPLAY
   if (decoded) display_stats(decoded * 1e6f / decode_us, decode_us / 1000.0f / decoded);
 #endif
@@ -591,6 +644,16 @@ void setup() {
   // the first line typed.
   while (Serial.available()) Serial.read();
   ready = true;
+#if PR24_BENCH
+  {
+    Serial.printf("bench: compiled prompt, greedy, %d tokens, no EOT stop, kv %s, checksum %d\n",
+                  N_GENERATE, PR24_KV_QUANT ? "quant" : "fp32", LOGIT_CHECKSUM);
+    uint16_t ids[sizeof(PROMPT_IDS) / sizeof(int)];
+    int n = sizeof(PROMPT_IDS) / sizeof(int);
+    for (int i = 0; i < n; i++) ids[i] = (uint16_t)PROMPT_IDS[i];
+    tell_story_ids(ids, n);
+  }
+#endif
   Serial.println("READY>");
 }
 
