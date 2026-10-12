@@ -533,6 +533,9 @@ typedef struct Scratch {
   float *x, *h, *qkv, *att, *g1, *g2, *ple, *tmpP, *trow, *logits;
   float *scores; // [seq_len], reused by each attention head
   float *kcache, *vcache; // [L * seq_len * D]; unused under LLM_KV_QUANT
+#ifndef LLM_KV_QUANT
+  float *scoresb; // [seq_len], second core's scores (insiderllm-p4 exact dual-core attention)
+#endif
 #ifdef LLM_KV_QUANT
   int8_t  *k8;    // [L][S][H][LLM_KPAD] int8 keys, zero padded
   float   *ks;    // [L][S][H] key scales
@@ -656,6 +659,44 @@ static void llm_attend_heads(Model *m, Scratch *s, int l, int pos, int h0, int h
 }
 #endif
 
+#ifndef LLM_KV_QUANT
+/* [insiderllm-p4] fp32 attention over heads h0..h1-1 of layer l at position pos,
+ * using the caller's scores buffer. The loop body is the original sequential
+ * loop of llm_forward moved here verbatim (same float operations in the same
+ * order per head), so running two disjoint head ranges on two cores, each with
+ * its own scores buffer, gives the same bits as one core running all heads.
+ * Reads q (s->qkv) and the KV cache up to pos; writes only s->att for its heads. */
+static void llm_attend_heads_f32(Model *m, Scratch *s, int l, int pos, int h0, int h1,
+                                 float *scores) {
+  int D = m->c.dim, H = m->c.n_heads, Dh = D / H, S = m->c.seq_len;
+  (void)H;
+  float *q = s->qkv;
+  float *kc = s->kcache + (size_t)l * S * D, *vc = s->vcache + (size_t)l * S * D;
+  float scale = 1.f / sqrtf((float)Dh);
+  for (int hh = h0; hh < h1; hh++) {
+    float *qh = q + hh * Dh;
+    float *ao = s->att + hh * Dh;
+    for (int i = 0; i < Dh; i++) ao[i] = 0.f;
+    float maxs = -1e30f;
+    // pass 1: max for stable softmax
+    for (int t = 0; t <= pos; t++) {
+      float *kt = kc + (size_t)t * D + hh * Dh, dot = 0.f;
+      for (int i = 0; i < Dh; i++) dot += qh[i] * kt[i];
+      dot *= scale;
+      scores[t] = dot;
+      if (dot > maxs) maxs = dot;
+    }
+    float denom = 0.f;
+    for (int t = 0; t <= pos; t++) {
+      float w = expf(scores[t] - maxs); denom += w;
+      float *vt = vc + (size_t)t * D + hh * Dh;
+      for (int i = 0; i < Dh; i++) ao[i] += w * vt[i];
+    }
+    for (int i = 0; i < Dh; i++) ao[i] /= denom;
+  }
+}
+#endif
+
 // One decode step: token at position pos -> logits[V]. KV cache persists across calls.
 /* Per-layer matvec dispatch: platform hook if set, otherwise MATVEC. */
 #define LLM_LMV(m, t, x, y) \
@@ -745,29 +786,10 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
     float *kc = s->kcache + (size_t)l * S * D, *vc = s->vcache + (size_t)l * S * D;
     memcpy(kc + (size_t)pos * D, k, D * sizeof(float));
     memcpy(vc + (size_t)pos * D, v, D * sizeof(float));
-    // causal attention over 0..pos
-    float scale = 1.f / sqrtf((float)Dh);
-    for (int hh = 0; hh < H; hh++) {
-      float *qh = q + hh * Dh;
-      float *ao = s->att + hh * Dh;
-      for (int i = 0; i < Dh; i++) ao[i] = 0.f;
-      float maxs = -1e30f;
-      // pass 1: max for stable softmax
-      for (int t = 0; t <= pos; t++) {
-        float *kt = kc + (size_t)t * D + hh * Dh, dot = 0.f;
-        for (int i = 0; i < Dh; i++) dot += qh[i] * kt[i];
-        dot *= scale;
-        s->scores[t] = dot;
-        if (dot > maxs) maxs = dot;
-      }
-      float denom = 0.f;
-      for (int t = 0; t <= pos; t++) {
-        float w = expf(s->scores[t] - maxs); denom += w;
-        float *vt = vc + (size_t)t * D + hh * Dh;
-        for (int i = 0; i < Dh; i++) ao[i] += w * vt[i];
-      }
-      for (int i = 0; i < Dh; i++) ao[i] /= denom;
-    }
+    // causal attention over 0..pos [insiderllm-p4: loop moved to llm_attend_heads_f32;
+    // a platform hook may split the heads across cores]
+    if (m->attn_heads) m->attn_heads(m, s, l, pos);
+    else llm_attend_heads_f32(m, s, l, pos, 0, H, s->scores);
 #endif
     LLM_LMV(m, &m->attn_proj[l], s->att, s->h);
     for (int i = 0; i < D; i++) s->x[i] += s->h[i];

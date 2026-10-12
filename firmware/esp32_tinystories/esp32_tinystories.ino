@@ -197,6 +197,11 @@ static float job_xs;
 static float *job_y;
 static int job_split;
 // Attention job: the worker takes heads [0, job_h) of layer job_l at job_pos.
+// [insiderllm-p4] P4_ATTN2=1 also splits the exact fp32 attention (PR24_KV_QUANT=0)
+// by head across the two cores; 0 keeps it on one core as the PR does.
+#ifndef P4_ATTN2
+#define P4_ATTN2 0
+#endif
 static int job_l, job_pos, job_h;
 enum { JOB_MATVEC, JOB_ATTN };
 static int job_kind = JOB_MATVEC;
@@ -225,6 +230,10 @@ static void worker_main(void *) {
     if (job_kind == JOB_ATTN)
       llm_attend_heads(&model, &s, job_l, job_pos, 0, job_h, s.q8b, s.w16b, s.scoresb);
     else
+#else
+    if (job_kind == JOB_ATTN)
+      llm_attend_heads_f32(&model, &s, job_l, job_pos, 0, job_h, s.scoresb);
+    else
 #endif
       matvec_rows(job_t, job_xq, job_xs, job_y, 0, job_split);
     xTaskNotifyGive(main_h);
@@ -240,6 +249,16 @@ static void attn_par(Model *m, Scratch *sc, int l, int pos) {
   job_kind = JOB_ATTN; job_l = l; job_pos = pos; job_h = H / 2;
   xTaskNotifyGive(worker_h);
   llm_attend_heads(m, sc, l, pos, H / 2, H, sc->q8, sc->w16, sc->scores);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  job_kind = JOB_MATVEC;
+}
+#else
+// [insiderllm-p4] Exact fp32 version: same split, the worker uses s.scoresb.
+static void attn_par(Model *m, Scratch *sc, int l, int pos) {
+  int H = m->c.n_heads;
+  job_kind = JOB_ATTN; job_l = l; job_pos = pos; job_h = H / 2;
+  xTaskNotifyGive(worker_h);
+  llm_attend_heads_f32(m, sc, l, pos, H / 2, H, sc->scores);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   job_kind = JOB_MATVEC;
 }
@@ -373,6 +392,7 @@ static void alloc_scratch() {
   // KV cache: 1.1MB, read once per position rather than per matvec.
   s.kcache = (float *)ps_or_die((size_t)L * S * D * 4, "kcache");
   s.vcache = (float *)ps_or_die((size_t)L * S * D * 4, "vcache");
+  s.scoresb = (float *)sram_or_die(S * 4, "scores b");
 #endif
 }
 
@@ -598,7 +618,7 @@ void setup() {
     // After the worker exists: matvec_par notifies worker_h.
     model.layer_matvec = matvec_par;
     model.head_matvec  = matvec_par;
-#ifdef LLM_KV_QUANT
+#if defined(LLM_KV_QUANT) || P4_ATTN2
     model.attn_heads = attn_par;
 #endif
   } else {
