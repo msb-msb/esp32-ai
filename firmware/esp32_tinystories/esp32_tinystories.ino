@@ -378,7 +378,24 @@ static void alloc_scratch() {
   s.scores = (float *)sram_or_die(S * 4, "scores");
   // logits: out_vocab floats, 99 KiB here, read once per token. Left in PSRAM
   // rather than spend a fifth of internal SRAM on it.
-  s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
+  // [insiderllm-p4] P4_LOGITS_SRAM=1 puts it in internal SRAM instead (as our S3
+  // LOGITS_SRAM); the heap is printed right before and after the allocation.
+#ifndef P4_LOGITS_SRAM
+#define P4_LOGITS_SRAM 0
+#endif
+  {
+    size_t f0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t b0 = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#if P4_LOGITS_SRAM
+    s.logits = (float *)sram_or_die((size_t)model.out_vocab * 4, "logits");
+#else
+    s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
+#endif
+    Serial.printf("logits -> %s %u B | internal free %u -> %u B, largest %u -> %u B\n",
+                  P4_LOGITS_SRAM ? "SRAM " : "PSRAM", (unsigned)((size_t)model.out_vocab * 4),
+                  (unsigned)f0, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)b0, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
 #ifdef LLM_KV_QUANT
   // Quantized KV cache: keys, values and scales in PSRAM (the caches cover
   // them well: keeping the keys in SRAM measured no gain, and the SRAM is
@@ -645,6 +662,9 @@ void setup() {
   Serial.printf("free: sram %.0f KB | psram %.2f MB\n",
                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024.0,
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1048576.0);
+  Serial.printf("heap end of setup: internal free %u B, largest %u B\n",   // [insiderllm-p4]
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 #ifdef LLM_KV_QUANT
   const char *kv_mode = "int8 keys / int16 values, vector dots";
 #else
