@@ -634,6 +634,7 @@ static bool core_int4_selftest() {
 #endif
 
 void setup() {
+  SYNC_INIT();   // [insiderllm-p4] power-01: sync pin driven low from boot (ia_s3_port.h; no-op without SYNC_GPIO)
   // Must be requested before begin(); a failed request falls back to 256.
 #if INTERACTIVE
 #undef SERIAL_RX_BYTES

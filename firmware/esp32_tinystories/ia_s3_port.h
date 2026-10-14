@@ -1,7 +1,7 @@
 // ia_s3_port.h - insiderllm-p4 (Miu, 2026-10-11). The S3 firmware's interactive line protocol,
 // PREFILL_SKIP, splitmix64 PRNG, ia_sample and FAST_SAMPLE, copied VERBATIM from our S3 board
-// build (esp32_tinystories.ino sha256 ba7d753624f9c15ab05e3d5f5c2c37f7a003e80c8fbe50cc4ad26536ec3d1b3d,
-// lines 106-155, 800-817, 833-1329) by p4/tools/extract_s3_interactive.sh. Do not edit by hand:
+// build (esp32_tinystories.ino sha256 ea055c359ade863d7d291faea1745825f226d2193d3d88fdb39662edc05c7f63,
+// lines 106-174, 819-836, 852-1350) by p4/tools/extract_s3_interactive.sh. Do not edit by hand:
 // re-run the script. Included by the P4 sketch, which builds on esp32-ai PR #24 (Barkin Sarikartal).
 // Requires from the sketch: model, s, blink(), llm_profile_reset(), and with LOGIT_CHECKSUM
 // logit_hash[] / fnv1a64() / LOGIT_CHECKSUM_TOKENS; VOCAB_EOT_ID from generated/vocab.h.
@@ -56,6 +56,25 @@
 #endif
 #if FAST_SAMPLE && !INTERACTIVE
 #error "FAST_SAMPLE is the INTERACTIVE sampler"
+#endif
+
+// Power-logger sync (tools/power-logger): SYNC_GPIO=<pin> drives that pin high
+// for each G command, from just before the prompt's prefill to just after the
+// last token, and low otherwise; the logger measures energy between the edges.
+// Both edges sit outside the timed llm_forward calls, so decode_ms_per_tok is
+// unchanged. The pin is a push-pull output driven low from the start of
+// setup(), so it is always driven: left as an input, it fought the logger's
+// pull-down and sat at ~0.95 V, where the logger's input chattered.
+// -1 (default) compiles all of it out. Share a ground with the logger.
+#ifndef SYNC_GPIO
+#define SYNC_GPIO -1
+#endif
+#if SYNC_GPIO >= 0
+#define SYNC_INIT() do { pinMode(SYNC_GPIO, OUTPUT); digitalWrite(SYNC_GPIO, LOW); } while (0)
+#define SYNC_SET(v) digitalWrite(SYNC_GPIO, (v) ? HIGH : LOW)
+#else
+#define SYNC_INIT() do { } while (0)
+#define SYNC_SET(v) do { } while (0)
 #endif
 
 // One prompt position. With PREFILL_SKIP and !last, the head hook is swapped for
@@ -495,6 +514,7 @@ static void ia_cmd_generate(char *p, int64_t t_g) {
 
   int pos = 0, tok = 0, decoded = 0;
   int64_t decode_us = 0, ttft_us = -1;
+  SYNC_SET(1);
   prefill(ia_prompt, ia_n_prompt, &pos);
   llm_profile_reset(&s);
   for (int step = 0; step < n && pos < model.c.seq_len; step++) {
@@ -526,6 +546,7 @@ static void ia_cmd_generate(char *p, int64_t t_g) {
     decoded++;
     if ((step & 7) == 0) delay(0);  // feed the task WDT ~every 8 tokens
   }
+  SYNC_SET(0);
   Serial.printf("D ttft_us=%lld decode_ms_per_tok=%.3f n=%d\n", (long long)ttft_us,
                 decoded ? decode_us / 1000.0 / decoded : 0.0, decoded);
 #if LOGIT_CHECKSUM
